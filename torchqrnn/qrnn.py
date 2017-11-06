@@ -8,6 +8,20 @@ else:
     from .forget_mult import ForgetMult
 
 
+class LayerNorm(nn.Module):
+
+    def __init__(self, features, eps=1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(features))
+        self.beta = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.gamma * ((x - mean) / (std + self.eps)) + self.beta
+
+
 class QRNNLayer(nn.Module):
     r"""Applies a single layer Quasi-Recurrent Neural Network (QRNN) to an input sequence.
 
@@ -29,7 +43,7 @@ class QRNNLayer(nn.Module):
         - h_n (batch, hidden_size): tensor containing the hidden state for t=seq_len
     """
 
-    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True, use_cuda=True):
+    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True, use_cuda=True, layer_norm=False):
         super(QRNNLayer, self).__init__()
 
         assert window in [1, 2], "This QRNN implementation currently only handles convolutional window of size 1 or size 2"
@@ -41,9 +55,13 @@ class QRNNLayer(nn.Module):
         self.prevX = None
         self.output_gate = output_gate
         self.use_cuda = use_cuda
+        self.layer_norm = layer_norm
 
         # One large matmul with concat is faster than N small matmuls and no concat
         self.linear = nn.Linear(self.window * self.input_size, 3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
+        if self.layer_norm:
+            print('Layer Norm QRNN')
+            self.midlnorm = LayerNorm(3 * self.hidden_size)
 
     def reset(self):
         # If you are saving the previous value of x, you should call this when starting with a new state
@@ -64,6 +82,8 @@ class QRNNLayer(nn.Module):
 
         # Matrix multiplication for the three outputs: Z, F, O
         Y = self.linear(source)
+        # Layer norm is applied internally before non-linear activations
+        if self.layer_norm: Y = self.midlnorm(Y)
         # Convert the tensor back to (batch, seq_len, len([Z, F, O]) * hidden_size)
         if self.output_gate:
             Y = Y.view(seq_len, batch_size, 3 * self.hidden_size)
