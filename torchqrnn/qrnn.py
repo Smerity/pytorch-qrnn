@@ -61,7 +61,7 @@ class QRNNLayer(nn.Module):
         self.linear = nn.Linear(self.window * self.input_size, 3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
         if self.layer_norm:
             print('Layer Norm QRNN')
-            self.midlnorm = LayerNorm(3 * self.hidden_size)
+            self.midlnorm = LayerNorm(3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
 
     def reset(self):
         # If you are saving the previous value of x, you should call this when starting with a new state
