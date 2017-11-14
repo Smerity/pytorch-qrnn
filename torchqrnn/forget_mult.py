@@ -115,6 +115,7 @@ class GPUForgetMult(torch.autograd.Function):
 
     def forward(self, f, x, hidden_init=None):
         self.compile()
+        assert f.is_contiguous() and x.is_contiguous(), 'Both inputs must be contiguous for ForgetMult GPU kernel'
         seq_size, batch_size, hidden_size = f.size()
         result = f.new(seq_size + 1, batch_size, hidden_size)
         # We only zero the result array (result[0]) if we don't set a hidden initial state
