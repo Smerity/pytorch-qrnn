@@ -43,7 +43,7 @@ class QRNNLayer(nn.Module):
         - h_n (batch, hidden_size): tensor containing the hidden state for t=seq_len
     """
 
-    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True, use_cuda=True, layer_norm=False):
+    def __init__(self, input_size, hidden_size=None, save_prev_x=False, zoneout=0, window=1, output_gate=True, use_cuda=True, layer_norm=False, z_activation=torch.nn.functional.tanh):
         super(QRNNLayer, self).__init__()
 
         assert window in [1, 2], "This QRNN implementation currently only handles convolutional window of size 1 or size 2"
@@ -56,6 +56,7 @@ class QRNNLayer(nn.Module):
         self.output_gate = output_gate
         self.use_cuda = use_cuda
         self.layer_norm = layer_norm
+        self.z_activation = z_activation
 
         # One large matmul with concat is faster than N small matmuls and no concat
         self.linear = nn.Linear(self.window * self.input_size, 3 * self.hidden_size if self.output_gate else 2 * self.hidden_size)
@@ -92,7 +93,7 @@ class QRNNLayer(nn.Module):
             Y = Y.view(seq_len, batch_size, 2 * self.hidden_size)
             Z, F = Y.chunk(2, dim=2)
         ###
-        Z = torch.nn.functional.tanh(Z)
+        Z = self.z_activation(Z)
         F = torch.nn.functional.sigmoid(F)
 
         # If zoneout is specified, we perform dropout on the forget gates in F
@@ -112,7 +113,10 @@ class QRNNLayer(nn.Module):
 
         # Forget Mult
         # For testing QRNN without ForgetMult CUDA kernel, C = Z * F may be useful
+        # Convert to and from float in the case the QRNN ForgetMult is being used with FP16
+        F, Z, hidden = (v.float() for v in (F, Z, hidden))
         C = ForgetMult()(F, Z, hidden, use_cuda=self.use_cuda)
+        C = C.type_as(source)
 
         # Apply (potentially optional) output gate
         if self.output_gate:
