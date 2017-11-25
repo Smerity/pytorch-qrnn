@@ -115,8 +115,8 @@ class GPUForgetMult(torch.autograd.Function):
 
     def forward(self, f, x, hidden_init=None):
         self.compile()
-        assert f.is_contiguous() and x.is_contiguous(), 'Both inputs must be contiguous for ForgetMult GPU kernel'
-        seq_size, batch_size, hidden_size = f.size()
+        assert f.is_contiguous() and x.is_contiguous(), 'Inputs must be contiguous for ForgetMult GPU kernel'
+        seq_size, batch_size, hidden_size = x.size()
         result = f.new(seq_size + 1, batch_size, hidden_size)
         # We only zero the result array (result[0]) if we don't set a hidden initial state
         # All other values (result[1:]) are overwritten by default
@@ -133,9 +133,11 @@ class GPUForgetMult(torch.autograd.Function):
     def backward(self, grad_h):
         self.compile()
         f, x, hidden_init = self.saved_tensors
+        # There is no guarantee the gradient tensor is contiguous
+        grad_h = grad_h.contiguous()
         h = self.result
         ###
-        seq_size, batch_size, hidden_size = f.size()
+        seq_size, batch_size, hidden_size = x.size()
         # Zeroing is not necessary as these will be overwritten
         grad_f = f.new(*f.size())
         grad_x = f.new(*f.size())

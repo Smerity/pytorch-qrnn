@@ -9,7 +9,6 @@ else:
 
 
 class LayerNorm(nn.Module):
-
     def __init__(self, features, eps=1e-6):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(features))
@@ -114,7 +113,7 @@ class QRNNLayer(nn.Module):
         # Forget Mult
         # For testing QRNN without ForgetMult CUDA kernel, C = Z * F may be useful
         # Convert to and from float in the case the QRNN ForgetMult is being used with FP16
-        F, Z, hidden = (v.float() for v in (F, Z, hidden))
+        F, Z, hidden = (v.float() if v is not None else v for v in (F, Z, hidden))
         C = ForgetMult()(F, Z, hidden, use_cuda=self.use_cuda)
         C = C.type_as(source)
 
