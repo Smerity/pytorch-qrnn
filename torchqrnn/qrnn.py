@@ -4,21 +4,10 @@ from torch.autograd import Variable
 
 if __name__ == '__main__':
     from forget_mult import ForgetMult
+    from layernorm import LayerNorm
 else:
     from .forget_mult import ForgetMult
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, features, eps=1e-6):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(features))
-        self.beta = nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.gamma * ((x - mean) / (std + self.eps)) + self.beta
+    from .layernorm import LayerNorm
 
 
 class QRNNLayer(nn.Module):
@@ -212,6 +201,10 @@ if __name__ == '__main__':
     diff = (Y - Z).sum().data[0]
     print('Total difference between QRNN(use_cuda=True) and QRNN(use_cuda=False) results:', diff)
     assert diff < 1e-5, 'CUDA and non-CUDA QRNN layers return different results'
+
+    qrnn = QRNNLayer(hidden_size, hidden_size, layer_norm=True)
+    qrnn.cuda()
+    L, _ = qrnn(X)
 
     from torch.autograd import gradcheck
     inputs = [X,]
