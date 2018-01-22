@@ -4,9 +4,11 @@ from torch.autograd import Variable
 
 if __name__ == '__main__':
     from forget_mult import ForgetMult
+    from zeroed_forget_mult import ZeroedForgetMult
     from layernorm import LayerNorm
 else:
     from .forget_mult import ForgetMult
+    from .zeroed_forget_mult import ZeroedForgetMult
     from .layernorm import LayerNorm
 
 
@@ -56,7 +58,7 @@ class QRNNLayer(nn.Module):
         # If you are saving the previous value of x, you should call this when starting with a new state
         self.prevX = None
 
-    def forward(self, X, hidden=None):
+    def forward(self, X, hidden=None, wids=None, zero_wid=None):
         seq_len, batch_size, _ = X.size()
 
         source = None
@@ -107,7 +109,10 @@ class QRNNLayer(nn.Module):
         # For testing QRNN without ForgetMult CUDA kernel, C = Z * F may be useful
         # Convert to and from float in the case the QRNN ForgetMult is being used with FP16
         F, Z, hidden = (v.float() if v is not None else v for v in (F, Z, hidden))
-        C = ForgetMult()(F, Z, hidden, use_cuda=self.use_cuda)
+        if wids is not None:
+            C = ZeroedForgetMult()(F, Z, wids, zero_wid, hidden_init=hidden, use_cuda=self.use_cuda)
+        else:
+            C = ForgetMult()(F, Z, hidden, use_cuda=self.use_cuda)
         C = C.type_as(source)
 
         # Apply (potentially optional) output gate
