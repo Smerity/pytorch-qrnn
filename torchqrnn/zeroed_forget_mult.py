@@ -9,7 +9,7 @@ from collections import namedtuple
 
 kernel = '''
 extern "C"
-__global__ void recurrent_forget_mult(float *dst, const float *f, const float *x, const long *wids, const long *zero_id, int SEQ, int BATCH, int HIDDEN)
+__global__ void recurrent_forget_mult(float *dst, const float *f, const float *x, const long *wids, const long *zero_id, const float *zero_vec, int SEQ, int BATCH, int HIDDEN)
 {
   /*
   Note: destination is assumed to be one timestep longer than f or x where dst[0] = h_{-1}
@@ -37,6 +37,8 @@ __global__ void recurrent_forget_mult(float *dst, const float *f, const float *x
      int wid_idx     = bid * SEQ + (ts - 1);
      if (wids[wid_idx] != zero_id[0])
        dst[dst_i]    += (1 - f[i]) * dst[dst_iminus1];
+     else
+       dst[dst_i]    += (1 - f[i]) * zero_vec[hid];
   }
 
   /*
@@ -50,7 +52,7 @@ __global__ void recurrent_forget_mult(float *dst, const float *f, const float *x
 }
 
 extern "C"
-__global__ void bwd_recurrent_forget_mult(const float *h, const float *f, const float *x, const float *gh, float *gf, float *gx, float *ghinit, const long *wids, const long *zero_id, int SEQ, int BATCH, int HIDDEN)
+__global__ void bwd_recurrent_forget_mult(const float *h, const float *f, const float *x, const float *gh, float *gf, float *gx, float *ghinit, float *gzvec, const long *wids, const long *zero_id, const float *zero_vec, int SEQ, int BATCH, int HIDDEN)
 {
   /*
   Note: h is assumed to be one timestep longer than f, x, gf, gx, or gh where dst[0] = h_{-1}
@@ -73,7 +75,8 @@ __global__ void bwd_recurrent_forget_mult(const float *h, const float *f, const 
      gx[i]           = f[i] * running_f;
      // Gradient of F
      if (wids[wid_idx] == zero_id[0]) {
-       gf[i]           = x[i] * running_f;
+       gf[i]           = (x[i] - zero_vec[hid]) * running_f;
+       gzvec[hid]      += (1 - f[i]) * running_f;
        running_f       = 0;
      }
      else {
@@ -91,7 +94,7 @@ class CPUForgetMult(torch.nn.Module):
     def __init__(self):
         super(CPUForgetMult, self).__init__()
 
-    def forward(self, f, x, wids, zero_wid, hidden_init=None):
+    def forward(self, f, x, wids, zero_wid, zero_vec, hidden_init=None):
         result = []
         ###
         forgets = f.split(1, dim=0)
@@ -104,7 +107,7 @@ class CPUForgetMult(torch.nn.Module):
             #print(((1 - forgets[i]) * prev_h) * (wids[i] != zero_wid).view(1, -1, 1).float())
             #print('-=-=-=-=-=-=-')
             if prev_h is not None:
-                h = h + ((1 - forgets[i]) * prev_h) * (wids[i] != zero_wid).view(1, -1, 1).float()
+                h = h + ((1 - forgets[i]) * prev_h) * (wids[i] != zero_wid).view(1, -1, 1).float() + ((1 - forgets[i]) * zero_vec) * (wids[i] == zero_wid).view(1, -1, 1).float()
             # h is (1, batch, hidden) when it needs to be (batch_hidden)
             # Calling squeeze will result in badness if batch size is 1
             h = h.view(h.size()[1:])
@@ -139,7 +142,7 @@ class GPUForgetMult(torch.autograd.Function):
 
         self.forget_mult, self.bwd_forget_mult, self.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
 
-    def forward(self, f, x, wids, zero_wids, hidden_init=None):
+    def forward(self, f, x, wids, zero_wids, zero_vec, hidden_init=None):
         self.compile()
         assert f.is_contiguous() and x.is_contiguous(), 'Inputs must be contiguous for ForgetMult GPU kernel'
         seq_size, batch_size, hidden_size = x.size()
@@ -152,14 +155,14 @@ class GPUForgetMult(torch.autograd.Function):
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), wids.data_ptr(), zero_wids.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
-        self.save_for_backward(f, x, hidden_init, wids, zero_wids)
+        self.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), wids.data_ptr(), zero_wids.data_ptr(), zero_vec.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        self.save_for_backward(f, x, hidden_init, wids, zero_wids, zero_vec)
         self.result = result
         return result[1:, :, :]
 
     def backward(self, grad_h):
         self.compile()
-        f, x, hidden_init, wids, zero_wids = self.saved_tensors
+        f, x, hidden_init, wids, zero_wids, zero_vec = self.saved_tensors
         # There is no guarantee the gradient tensor is contiguous
         grad_h = grad_h.contiguous()
         h = self.result
@@ -169,14 +172,15 @@ class GPUForgetMult(torch.autograd.Function):
         grad_f = f.new(*f.size())
         grad_x = f.new(*f.size())
         grad_h_init = f.new(batch_size, hidden_size)
+        grad_zero_v = f.new(hidden_size)
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), wids.data_ptr(), zero_wids.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        self.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), grad_zero_v.data_ptr(), wids.data_ptr(), zero_wids.data_ptr(), zero_vec.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
         ###
         if hidden_init is not None:
-            return grad_f, grad_x, None, None, grad_h_init
-        return grad_f, grad_x, None, None
+            return grad_f, grad_x, None, None, grad_zero_v, grad_h_init
+        return grad_f, grad_x, None, None, grad_zero_v
 
 
 class ZeroedForgetMult(torch.nn.Module):
@@ -195,7 +199,7 @@ class ZeroedForgetMult(torch.nn.Module):
     def __init__(self):
         super(ZeroedForgetMult, self).__init__()
 
-    def forward(self, f, x, wids, zero_wid, hidden_init=None, use_cuda=True):
+    def forward(self, f, x, wids, zero_wid, zero_vec, hidden_init=None, use_cuda=True):
         # Use CUDA by default unless it's available
         use_cuda = use_cuda and torch.cuda.is_available()
         # Ensure the user is aware when ForgetMult is not GPU version as it's far faster
@@ -203,7 +207,7 @@ class ZeroedForgetMult(torch.nn.Module):
         ###
         # Avoiding 'RuntimeError: expected a Variable argument, but got NoneType' when hidden_init is None
         if hidden_init is None: return GPUForgetMult()(f, x) if use_cuda else CPUForgetMult()(f, x)
-        return GPUForgetMult()(f, x, wids, zero_wid, hidden_init) if use_cuda else CPUForgetMult()(f, x, wids, zero_wid, hidden_init)
+        return GPUForgetMult()(f, x, wids, zero_wid, zero_vec, hidden_init) if use_cuda else CPUForgetMult()(f, x, wids, zero_wid, zero_vec, hidden_init)
 
 ###
 
@@ -217,6 +221,7 @@ if __name__ == '__main__':
     a      = Variable(torch.rand(seq, batch, hidden).cuda(), requires_grad=True)
     forget = Variable(torch.rand(seq, batch, hidden).cuda(), requires_grad=True)
     last_h = Variable(torch.rand(batch, hidden).cuda(), requires_grad=True)
+    zero_v = Variable(torch.rand(hidden).cuda(), requires_grad=True)
     zero_wid = Variable(torch.LongTensor([42]).cuda())
     wids = Variable(torch.LongTensor([[0, 1, 42, 3], [0, 42, 2, 3]]).cuda())
     #wids = Variable(torch.LongTensor([[0, 42, 2, 3]]).cuda())
@@ -225,7 +230,7 @@ if __name__ == '__main__':
     print('CUDA forget mult')
     print('=-=-' * 5)
 
-    resulta = ZeroedForgetMult()(forget, a, wids, zero_wid, hidden_init=last_h, use_cuda=True)
+    resulta = ZeroedForgetMult()(forget, a, wids, zero_wid, zero_v, hidden_init=last_h, use_cuda=True)
     print(resulta.sum())
     loss = resulta.pow(2).sum()
     loss.backward()
@@ -234,6 +239,7 @@ if __name__ == '__main__':
     print('X grad =', a.grad.mean().data[0])
     print('Forget grad =', forget.grad.mean().data[0])
     print('Last H grad =', last_h.grad.mean().data[0])
+    print('Zero V grad =', zero_v.grad.mean().data[0])
 
     x_grad_copy = a.grad.clone()
 
@@ -244,8 +250,9 @@ if __name__ == '__main__':
     a.grad.data *= 0
     forget.grad.data *= 0
     last_h.grad.data *= 0
+    zero_v.grad.data *= 0
 
-    resultb = ZeroedForgetMult()(forget, a, wids, zero_wid, hidden_init=last_h, use_cuda=False)
+    resultb = ZeroedForgetMult()(forget, a, wids, zero_wid, zero_v, hidden_init=last_h, use_cuda=False)
     print(resultb.sum())
     print(resultb.size())
     loss = resultb.pow(2).sum()
@@ -255,6 +262,7 @@ if __name__ == '__main__':
     print('X grad =', a.grad.mean().data[0])
     print('Forget grad =', forget.grad.mean().data[0])
     print('Last H grad =', last_h.grad.mean().data[0])
+    print('Zero V grad =', zero_v.grad.mean().data[0])
 
     ###
 
